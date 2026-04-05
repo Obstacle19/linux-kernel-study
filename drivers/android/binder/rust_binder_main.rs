@@ -3,23 +3,33 @@
 // Copyright (C) 2025 Google LLC.
 
 //! Binder -- the Android IPC mechanism.
-#![recursion_limit = "256"]
-#![allow(
+
+// 核心：用 Rust 实现一个 Binder 驱动，并把它挂到 Linux 内核的 VFS + binderfs 上
+
+#![recursion_limit = "256"] // 把宏展开和类型推导等内部递归深度上限调到 256
+#![allow( // 关闭下面这些 Clippy 警告
     clippy::as_underscore,
     clippy::ref_as_ptr,
     clippy::ptr_as_ptr,
     clippy::cast_lossless
 )]
 
+// 引入 kernel crate
 use kernel::{
+    // bindings（C 绑定层），rust/bindings/bindings_generated.rs
+    // seq_file == sequential file，表示顺序文件
     bindings::{self, seq_file},
+    // 文件系统，rust/kernel/fs.rs
     fs::File,
+    // 内核链表，rust/kernel/list/
     list::{ListArc, ListArcSafe, ListLinksSelfPtr, TryNewListArc},
+    // 通用导入，rust/kernel/prelude.rs
     prelude::*,
     seq_file::SeqFile,
     seq_print,
     sync::atomic::{ordering::Relaxed, Atomic},
     sync::poll::PollTable,
+    // Arc == atomic reference counting，原子引用计数
     sync::Arc,
     task::Pid,
     transmute::AsBytes,
@@ -27,10 +37,14 @@ use kernel::{
     uaccess::UserSliceWriter,
 };
 
+// 引入 binder crate
+// crate 在这里表示 drivers/android/binder
 use crate::{context::Context, page_range::Shrinker, process::Process, thread::Thread};
 
-use core::ptr::NonNull;
+// 引入 Rust 标准库自带的 core crate
+use core::ptr::NonNull; // 引入非空指针类型，表示保证不为 NULL 的裸指针
 
+// 使用 mod 声明把 binder 的主要子系统拉进来
 mod allocation;
 mod context;
 mod deferred_close;
@@ -45,25 +59,50 @@ mod thread;
 mod trace;
 mod transaction;
 
+// 关闭这一段代码的所有编译警告
 #[allow(warnings)] // generated bindgen code
+
+// Rust 代码不会直接实现 binderfs，而是调用 C 里的函数
 mod binderfs {
+    // inode（index node），是文件的元数据入口
+    // dentry（directory entry），目录项，是路径名字到 inode 的映射
     use kernel::bindings::{dentry, inode};
 
+    // extern "C" 声明这个函数存在于别的地方，且需要用 C 的调用约定去调用它
+    // 该声明仅提供符号签名，不包含实现
+    // Rust 不知道实现在哪，也不负责找 .c 文件，函数解析完全依赖链接阶段：
+    // 编译流程：
+    //   Rust (.rs) → .o
+    //   C    (.c ) → .o
+    // 在 Makefile 里链接时，按符号名解析，若符号存在则链接成功；否则报 undefined reference
     extern "C" {
-        pub fn init_rust_binderfs() -> kernel::ffi::c_int;
+        // 初始化 binderfs 文件系统
+        pub fn init_rust_binderfs() -> kernel::ffi::c_int; // root/rust/ffi.rs 里标明：c_int = i32;
     }
+    /// 这里面rs和c类型转换时候会不会有 bug？
+
+    // 为某个打开 binder 的进程创建按 pid 命名的调试文件：/dev/binderfs/binder_logs/proc/<pid>
     extern "C" {
         pub fn rust_binderfs_create_proc_file(
-            nodp: *mut inode,
-            pid: kernel::ffi::c_int,
+            nodp: *mut inode, // binderfs 的 inode
+            pid: kernel::ffi::c_int, // 某个 binder 进程的 id
         ) -> *mut dentry;
     }
+
+    // 删除 binderfs 中的调试文件
     extern "C" {
         pub fn rust_binderfs_remove_file(dentry: *mut dentry);
     }
-    pub type rust_binder_context = *mut kernel::ffi::c_void;
-    #[repr(C)]
-    #[derive(Copy, Clone)]
+
+    // 创建类型别名 rust_binder_context
+    // rust_binder_context 用于在 C 和 Rust 之间传递 Binder 上下文对象
+    // 对 C 来说，Rust 的 Context 是不透明类型，所以这里只能用 void* 表示
+    // 所以 rust_binder_context 是由 Arc<Context> 转换来的不透明裸指针
+    pub type rust_binder_context = *mut kernel::ffi::c_void; // root/rust/ffi.rs 里标明：pub use core::ffi::c_void;
+    // 这里面 Arc<Context> 和 void* 的转换能不能 fuzz 出 bug？
+
+    #[repr(C)] // 用 C 的内存布局来排列这个 struct
+    #[derive(Copy, Clone)] // 表示这个 struct 可以按位拷贝
     pub struct binder_device {
         pub minor: kernel::ffi::c_int,
         pub ctx: rust_binder_context,
