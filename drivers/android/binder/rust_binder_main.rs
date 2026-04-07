@@ -104,39 +104,48 @@ mod binderfs {
     #[repr(C)] // 用 C 的内存布局来排列这个 struct
     #[derive(Copy, Clone)] // 表示这个 struct 可以按位拷贝
     pub struct binder_device {
-        pub minor: kernel::ffi::c_int,
-        pub ctx: rust_binder_context,
+        // 内核中主设备号用来标识设备驱动类型（如 binder 驱动），次设备号用来区分同一类型的不同设备实例（如 /dev/binder0、/dev/binder1 等）
+        pub minor: kernel::ffi::c_int, // minor == minor number，表示次设备号
+        pub ctx: rust_binder_context, // ctx == context，表示 binder 设备对应的上下文
     }
     impl Default for binder_device {
-        fn default() -> Self {
+        fn default() -> Self { // default() 函数使用方式：let dev = binder_device::default();
+            // 分配一块未初始化内存来存放 binder_device 结构体
             let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+            // Rust 规定 手动操作内存是 unsafe 的，所以写在 unsafe 块里
             unsafe {
-                ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-                s.assume_init()
+                ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1); // 将这块内存的每个字节都设置为 0，确保所有字段都被初始化为零值
+                s.assume_init() // 将这块内存转换成 binder_device 结构体实例，并返回
             }
         }
     }
 }
 
+// 把 Rust Binder 注册成内核模块 rust_binder
 module! {
-    type: BinderModule,
-    name: "rust_binder",
-    authors: ["Wedson Almeida Filho", "Alice Ryhl"],
-    description: "Android Binder",
-    license: "GPL",
+    type: BinderModule, // 模块类型
+    name: "rust_binder", // 模块名字
+    authors: ["Wedson Almeida Filho", "Alice Ryhl"], // 模块作者
+    description: "Android Binder", // 模块描述
+    license: "GPL", // 模块许可证
 }
 
-use kernel::bindings::rust_binder_layout;
-#[no_mangle]
+use kernel::bindings::rust_binder_layout; // rust/bindings/bindings_generated.rs 里定义 rust_binder_layout 结构体
+#[no_mangle] // 告诉 Rust 编译器不要对这个符号名做名字改写，以便 C 代码能通过符号名找到它
+// 全局静态对象把三个模块导出的布局信息汇总成一个统一入口
 static RUST_BINDER_LAYOUT: rust_binder_layout = rust_binder_layout {
     t: transaction::TRANSACTION_LAYOUT,
     p: process::PROCESS_LAYOUT,
     n: node::NODE_LAYOUT,
 };
 
+// 每调用一次 next_debug_id，就返回一个数字
+// 这个数字来自一个全局计数器，第一次返回 0，第二次返回 1，第三次返回 2，依次递增
 fn next_debug_id() -> usize {
-    static NEXT_DEBUG_ID: Atomic<usize> = Atomic::new(0);
+    static NEXT_DEBUG_ID: Atomic<usize> = Atomic::new(0); // Atomic 可以保证并发加一不会数据竞争
 
+    // fetch_add 的语义是：先把当前值读出来作为返回值，再做加一写回 NEXT_DEBUG_ID
+    // Relaxed 表示这个操作不需要任何内存顺序保证，适合纯计数器这种不依赖其他内存操作的场景
     NEXT_DEBUG_ID.fetch_add(1, Relaxed)
 }
 
@@ -398,22 +407,34 @@ unsafe extern "C" fn rust_binder_remove_context(device: *mut kernel::ffi::c_void
 
 /// # Safety
 /// Only called by binderfs.
+
+// extern "C" { fn foo(); } 表示函数在 C 实现
+// extern "C" fn foo() {} 表示函数在 Rust 实现
+
+// 这个函数是 binderfs 在打开 binder 设备文件时调用的回调函数
+// 当用户态 open("/dev/binder") 时，内核（C）会调用这个 Rust 函数
+// 它负责：创建 binder 进程上下文 + 绑定到 file
 unsafe extern "C" fn rust_binder_open(
-    inode: *mut bindings::inode,
-    file_ptr: *mut bindings::file,
+    inode: *mut bindings::inode, // binderfs 传入的 inode，表示被打开的设备文件
+    file_ptr: *mut bindings::file, // binderfs 传入的 file，表示被打开的设备文件对应的内核 file 结构体
 ) -> kernel::ffi::c_int {
     // SAFETY: The `rust_binderfs.c` file ensures that `i_private` is set to a
     // `struct binder_device`.
+    // i_private 是 binderfs 在注册设备时设置的私有字段，指向一个 binder_device 结构体，其中包含了 binder 设备对应的上下文信息
     let device = unsafe { (*inode).i_private } as *const binderfs::binder_device;
 
+    // 断言 device 不为 NULL，否则说明 binderfs 没有正确设置 i_private 字段，无法继续处理这个 open 调用
     assert!(!device.is_null());
 
     // SAFETY: The `rust_binderfs.c` file ensures that `device->ctx` holds a binder context when
     // using the rust binder fops.
+    // 从 device->ctx 取出 binder 全局上下文
     let ctx = unsafe { Arc::<Context>::borrow((*device).ctx) };
 
     // SAFETY: The caller provides a valid file pointer to a new `struct file`.
+    // 
     let file = unsafe { File::from_raw_file(file_ptr) };
+    // 创建一个新的 binder 进程，并把它绑定到这个文件上
     let process = match Process::open(ctx, file) {
         Ok(process) => process,
         Err(err) => return err.to_errno(),
